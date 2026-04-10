@@ -819,14 +819,71 @@ function showPRBanner(exerciseName, weight, isKb) {
   setTimeout(()=>banner.classList.remove('show'), 4000);
 }
 
+// ─── DRAFT AUTOSAVE ───────────────────────────────────────────────────────────
+function draftKey() { return 'mt_v3_draft_' + currentDay; }
+
+function saveDraft() {
+  const day = DAYS[currentDay];
+  const draft = { dayIdx: currentDay, notes: document.getElementById('session-notes')?.value || '', sets: {} };
+  day.exercises.forEach((ex, ei) => {
+    for (let s = 0; s < ex.sets; s++) {
+      const w = document.getElementById(`w-${ei}-${s}`)?.value || '';
+      const r = document.getElementById(`r-${ei}-${s}`)?.value || '';
+      const done = document.getElementById(`dn-${ei}-${s}`)?.classList.contains('checked') || false;
+      if (w || r || done) draft.sets[`${ei}-${s}`] = { w, r, done };
+    }
+  });
+  try { localStorage.setItem(draftKey(), JSON.stringify(draft)); } catch(e) {}
+}
+
+function loadDraft() {
+  try {
+    const raw = localStorage.getItem(draftKey());
+    if (!raw) return false;
+    const draft = JSON.parse(raw);
+    if (draft.dayIdx !== currentDay) return false;
+    let restored = 0;
+    Object.entries(draft.sets).forEach(([key, val]) => {
+      const [ei, si] = key.split('-');
+      const wEl = document.getElementById(`w-${ei}-${si}`);
+      const rEl = document.getElementById(`r-${ei}-${si}`);
+      const dEl = document.getElementById(`dn-${ei}-${si}`);
+      if (wEl && val.w) { wEl.value = val.w; restored++; }
+      if (rEl && val.r) { rEl.value = val.r; }
+      if (dEl && val.done) { dEl.classList.add('checked'); dEl.textContent = '✓'; }
+    });
+    if (document.getElementById('session-notes') && draft.notes) {
+      document.getElementById('session-notes').value = draft.notes;
+    }
+    return restored > 0;
+  } catch(e) { return false; }
+}
+
+function clearDraft() {
+  try { localStorage.removeItem(draftKey()); } catch(e) {}
+}
+
 // ─── WORKOUT ──────────────────────────────────────────────────────────────────
+
+// Returns { exerciseName: [{weight, reps}, ...] } from the last session of same day
+function getLastSessionData(dayName) {
+  const last = sessions.find(s => s.day === dayName);
+  if (!last) return {};
+  const map = {};
+  (last.lifts || []).forEach(l => { map[l.exercise] = l.sets; });
+  return map;
+}
+
 function buildWorkout() {
   const day = DAYS[currentDay];
+  const lastData = getLastSessionData(day.name);
   document.getElementById('workout-title').textContent = day.name;
-  let html = `<p style="font-size:13px;color:var(--text2);margin-bottom:14px;line-height:1.5">Log your weights and reps. Tap ✓ when a set is done — rest timer starts automatically.</p>`;
+  let html = `<div id="draft-banner" style="display:none;background:var(--accent-bg);border:0.5px solid var(--accent);border-radius:var(--r-sm);padding:9px 14px;margin-bottom:12px;font-size:13px;color:var(--accent);font-weight:500">⚡ Draft restored — pick up where you left off</div>`;
+  html += `<p style="font-size:13px;color:var(--text2);margin-bottom:14px;line-height:1.5">Log your weights and reps. Tap ✓ when a set is done — rest timer starts automatically.</p>`;
   day.exercises.forEach((ex,ei)=>{
     const isKb = ex.name.toLowerCase().includes('kettlebell') || ex.name.toLowerCase().includes('kb') || ex.name.toLowerCase().includes('turkish') || ex.name.toLowerCase().includes('farmer');
     const weightUnit = isKb ? 'kg' : 'lbs';
+    const lastSets = lastData[ex.name] || [];
     html+=`<div class="ex-block">
       <div class="ex-hdr">
         <div><div class="ex-name">${ex.name}</div><div class="ex-scheme">Target: ${ex.scheme}</div></div>
@@ -834,14 +891,20 @@ function buildWorkout() {
       </div>`;
     for (let s=0;s<ex.sets;s++) {
       const nextLabel = s<ex.sets-1 ? `Next: Set ${s+2} of ${ex.sets}` : `Next exercise`;
-      html+=`<div class="set-row">
+      const prev = lastSets[s];
+      const prevLabel = prev && (prev.weight > 0 || prev.reps > 0)
+        ? `<span style="font-size:11px;color:var(--text3);font-family:var(--font-mono);margin-left:2px" title="Last session">Last: ${prev.weight > 0 ? prev.weight + weightUnit : '—'} × ${prev.reps > 0 ? prev.reps : '—'}</span>`
+        : `<span style="font-size:11px;color:var(--text3);margin-left:2px">First time</span>`;
+      html+=`<div class="set-row" style="flex-wrap:wrap;gap:6px 8px">
         <span class="set-num">S${s+1}</span>
         <input class="set-input set-input-kg" type="number" placeholder="${weightUnit}" id="w-${ei}-${s}" min="0" step="0.5" inputmode="decimal"
-          onchange="checkInputPR(${ei},${s},'${ex.name.replace(/'/g,"\\'")}')">
+          oninput="checkInputPR(${ei},${s},'${ex.name.replace(/'/g,"\\'")}');saveDraft()">
         <span class="set-sep">×</span>
-        <input class="set-input set-input-reps" type="number" placeholder="reps" id="r-${ei}-${s}" min="0" inputmode="numeric">
+        <input class="set-input set-input-reps" type="number" placeholder="reps" id="r-${ei}-${s}" min="0" inputmode="numeric"
+          oninput="saveDraft()">
         <button class="set-done-btn" id="dn-${ei}-${s}"
           onclick="completeSet(this,${ei},${s},'${ex.name.replace(/'/g,"\\'")}','${nextLabel}',${isKb})">✓</button>
+        <div style="width:100%;padding-left:32px;margin-top:-2px;margin-bottom:2px">${prevLabel}</div>
       </div>`;
     }
     html+=`</div>`;
@@ -849,12 +912,21 @@ function buildWorkout() {
   html+=`
     <div style="margin-top:8px">
       <div class="sec-label" style="margin-bottom:8px">Session notes</div>
-      <textarea class="notes-area" id="session-notes" rows="4" placeholder="How did it feel? Any PRs? Energy, sleep, pain? Anything goes..."></textarea>
+      <textarea class="notes-area" id="session-notes" rows="4" placeholder="How did it feel? Any PRs? Energy, sleep, pain? Anything goes..." oninput="saveDraft()"></textarea>
     </div>
     <div style="margin-top:12px;margin-bottom:32px">
       <button class="btn btn-accent" onclick="finishWorkout()">Finish & Save Session</button>
     </div>`;
   document.getElementById('workout-scroll').innerHTML = html;
+
+  // Restore draft after DOM is built
+  setTimeout(() => {
+    const restored = loadDraft();
+    if (restored) {
+      const banner = document.getElementById('draft-banner');
+      if (banner) { banner.style.display = 'block'; setTimeout(() => banner.style.display = 'none', 4000); }
+    }
+  }, 50);
 }
 
 function checkInputPR(ei, si, exName) {
@@ -875,6 +947,8 @@ function completeSet(btn, ei, si, exName, nextLabel, isKb) {
   }
   btn.classList.toggle('checked');
   const isChecked = btn.classList.contains('checked');
+  btn.textContent = '✓';
+  saveDraft();
   if (isChecked) {
     if (checkPR(exName, w)) {
       btn.classList.add('set-pr');
@@ -901,7 +975,7 @@ function finishWorkout() {
     if(setData.length) lifts.push({exercise:ex.name,sets:setData});
   });
   sessions.unshift({date:new Date().toISOString(),day:day.name,focus:day.focus,notes,sets:setsLogged,lifts});
-  save(); goTo('s-home'); updateHome();
+  save(); clearDraft(); goTo('s-home'); updateHome();
   alert(`✅ Session saved!\n${setsLogged} sets logged.\n\nGreat work! 💪`);
 }
 
