@@ -1046,9 +1046,9 @@ function renderTargets() {
   // GRAY             = no data yet
   function getSignal(exName) {
     const hist = exHistory[exName];
-    if (!hist || hist.length === 0) return { signal: 'none', label: 'No data yet', color: 'var(--text3)' };
+    if (!hist || hist.length === 0) return { signal: 'none', label: 'No data yet', color: 'var(--text3)', bg: '' };
     const meta = exMeta[exName];
-    if (!meta) return { signal: 'none', label: 'No data yet', color: 'var(--text3)' };
+    if (!meta) return { signal: 'none', label: 'No data yet', color: 'var(--text3)', bg: '' };
     const targetSets = meta.targetSets;
     const last = hist[hist.length - 1];
     const prev = hist.length >= 2 ? hist[hist.length - 2] : null;
@@ -1121,8 +1121,8 @@ function renderTargets() {
       if (!isBodyweight && targetNum && current > 0) pct = Math.min(100, Math.round((current / targetNum) * 100));
       else if (isBodyweight) pct = 100;
 
-      const signalDot = signal === 'none' ? `<span style="width:8px;height:8px;border-radius:50%;background:var(--text3);display:inline-block;margin-right:6px"></span>`
-        : `<span style="width:8px;height:8px;border-radius:50%;background:${color};display:inline-block;margin-right:6px"></span>`;
+      const signalIcon = signal === 'increase' ? '🟢' : signal === 'hold' ? '🟡' : signal === 'drop' ? '🔴' : '⚪';
+      const signalDot = `<span style="font-size:12px;margin-right:4px">${signalIcon}</span>`;
 
       html += `<div class="target-row" style="${bg ? `background:${bg};border-color:${color}40` : ''}">
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
