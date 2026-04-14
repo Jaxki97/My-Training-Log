@@ -791,6 +791,16 @@ function skipRest() {
   document.getElementById('rest-overlay').classList.remove('active');
 }
 
+// ─── UNIT HELPER ──────────────────────────────────────────────────────────────
+// Single source of truth for whether an exercise uses kg or lbs
+function isKbExercise(name) {
+  const n = name.toLowerCase();
+  return n.includes('kettlebell') || n.includes(' kb ') || n.startsWith('kb ') || n.includes('turkish') || n.includes('farmer') || n.includes('swing') || n.includes('snatch') || n.includes('windmill') || n.includes('clean') || n.includes('goblet') || n.includes('around-the-body');
+}
+function getUnit(exerciseName) {
+  return isKbExercise(exerciseName) ? 'kg' : 'lbs';
+}
+
 // ─── PR DETECTION ─────────────────────────────────────────────────────────────
 function getBestWeight(exerciseName) {
   let best = 0;
@@ -812,8 +822,8 @@ function checkPR(exerciseName, weight) {
 
 function showPRBanner(exerciseName, weight, isKb) {
   const banner = document.getElementById('pr-banner');
-  const unit = isKb ? 'kg' : 'lbs';
-  document.getElementById('pr-title').textContent = '🏆 New PR — '+exerciseName+'!';
+  const unit = getUnit(exerciseName);
+  document.getElementById('pr-title').textContent = 'New PR — '+exerciseName+'!';
   document.getElementById('pr-sub').textContent = weight+unit+' · Your best ever on this lift';
   banner.classList.add('show');
   setTimeout(()=>banner.classList.remove('show'), 4000);
@@ -881,8 +891,8 @@ function buildWorkout() {
   let html = `<div id="draft-banner" style="display:none;background:var(--accent-bg);border:0.5px solid var(--accent);border-radius:var(--r-sm);padding:9px 14px;margin-bottom:12px;font-size:13px;color:var(--accent);font-weight:500">⚡ Draft restored — pick up where you left off</div>`;
   html += `<p style="font-size:13px;color:var(--text2);margin-bottom:14px;line-height:1.5">Log your weights and reps. Tap ✓ when a set is done — rest timer starts automatically.</p>`;
   day.exercises.forEach((ex,ei)=>{
-    const isKb = ex.name.toLowerCase().includes('kettlebell') || ex.name.toLowerCase().includes('kb') || ex.name.toLowerCase().includes('turkish') || ex.name.toLowerCase().includes('farmer');
-    const weightUnit = isKb ? 'kg' : 'lbs';
+    const isKb = isKbExercise(ex.name);
+    const weightUnit = getUnit(ex.name);
     const lastSets = lastData[ex.name] || [];
     html+=`<div class="ex-block">
       <div class="ex-hdr">
@@ -982,43 +992,160 @@ function finishWorkout() {
 // ─── TARGETS ──────────────────────────────────────────────────────────────────
 function renderTargets() {
   const el = document.getElementById('targets-scroll');
-  // Build best weight map from history
-  const bestMap = {};
-  sessions.forEach(s=>(s.lifts||[]).forEach(l=>{
-    const done = l.sets.filter(x=>x.done&&x.weight>0).map(x=>x.weight);
-    if (done.length) {
-      const best = Math.max(...done);
-      if (!bestMap[l.exercise]||best>bestMap[l.exercise]) bestMap[l.exercise]=best;
-    }
+
+  // ── Build per-exercise session history ──────────────────────────────────────
+  // exHistory[name] = [ { date, bestWeight, totalDone, targetSets, targetReps }, ... ] oldest first
+  const exHistory = {};
+
+  // Parse target reps from scheme string e.g. "4 × 6" → 6, "3 × 8/side" → 8
+  function parseTargetReps(scheme) {
+    const m = scheme.match(/×\s*(\d+)/);
+    return m ? parseInt(m[1]) : 6;
+  }
+  function parseTargetSets(scheme) {
+    const m = scheme.match(/^(\d+)/);
+    return m ? parseInt(m[1]) : 3;
+  }
+
+  // Build lookup: exerciseName → { targetSets, targetReps }
+  const exMeta = {};
+  DAYS.forEach(day => day.exercises.forEach(ex => {
+    exMeta[ex.name] = {
+      targetSets: parseTargetSets(ex.scheme),
+      targetReps: parseTargetReps(ex.scheme),
+      targetWeight: ex.targetWeight,
+      targetNote: ex.targetNote,
+      isKb: isKbExercise(ex.name),
+      isBodyweight: ex.targetWeight.toLowerCase().includes('body') || ex.targetWeight.toLowerCase().includes('bw') || ex.targetWeight.toLowerCase().includes('effort'),
+    };
   }));
 
-  let html = `<p style="font-size:13px;color:var(--text2);margin-bottom:16px;line-height:1.5">These are the weight targets to hit before I adjust your programme. Once you reach a target for 2 sessions in a row, export your data and we progress.</p>`;
+  [...sessions].reverse().forEach(s => {
+    (s.lifts || []).forEach(l => {
+      if (!exHistory[l.exercise]) exHistory[l.exercise] = [];
+      const doneSets = l.sets.filter(x => x.done && x.weight > 0);
+      const bestWeight = doneSets.length ? Math.max(...doneSets.map(x => x.weight)) : 0;
+      const meta = exMeta[l.exercise];
+      const targetReps = meta ? meta.targetReps : 6;
+      // Count sets that hit the target reps
+      const setsHittingTarget = l.sets.filter(x => x.done && x.reps >= targetReps).length;
+      const totalDoneSets = l.sets.filter(x => x.done).length;
+      exHistory[l.exercise].push({
+        date: s.date,
+        bestWeight,
+        setsHittingTarget,
+        totalDoneSets,
+      });
+    });
+  });
 
-  DAYS.forEach(day=>{
-    html+=`<div class="target-day-hdr">${day.name} — ${day.focus}</div>`;
-    day.exercises.forEach(ex=>{
-      // Parse numeric target weight if possible
-      const isBodyweight = ex.targetWeight.toLowerCase().includes('body') || ex.targetWeight.toLowerCase().includes('bw') || ex.targetWeight.toLowerCase().includes('effort');
+  // ── Progressive overload signal per exercise ────────────────────────────────
+  // GREEN (increase) = last 2 sessions both hit target sets+reps
+  // AMBER (hold)     = last session hit target but not 2 in a row, OR only 1 session logged
+  // RED (drop/fix)   = last session missed target reps significantly
+  // GRAY             = no data yet
+  function getSignal(exName) {
+    const hist = exHistory[exName];
+    if (!hist || hist.length === 0) return { signal: 'none', label: 'No data yet', color: 'var(--text3)' };
+    const meta = exMeta[exName];
+    if (!meta) return { signal: 'none', label: 'No data yet', color: 'var(--text3)' };
+    const targetSets = meta.targetSets;
+    const last = hist[hist.length - 1];
+    const prev = hist.length >= 2 ? hist[hist.length - 2] : null;
+    const lastHit = last.setsHittingTarget >= targetSets;
+    const prevHit = prev ? prev.setsHittingTarget >= targetSets : false;
+
+    if (lastHit && prevHit) return { signal: 'increase', label: 'Increase weight', color: '#34C759', bg: 'rgba(52,199,89,0.12)' };
+    if (lastHit && !prev) return { signal: 'hold', label: 'Hold — need 1 more session', color: '#FF9500', bg: 'rgba(255,149,0,0.12)' };
+    if (lastHit && !prevHit) return { signal: 'hold', label: 'Hold — 1 of 2 sessions hit', color: '#FF9500', bg: 'rgba(255,149,0,0.12)' };
+    if (!lastHit && last.setsHittingTarget > 0) return { signal: 'hold', label: 'Almost — missed by 1-2 sets', color: '#FF9500', bg: 'rgba(255,149,0,0.12)' };
+    return { signal: 'drop', label: 'Focus on form / reduce weight', color: '#FF4444', bg: 'rgba(255,68,68,0.10)' };
+  }
+
+  // ── Suggested next weight ───────────────────────────────────────────────────
+  function getNextWeight(exName, signal) {
+    const hist = exHistory[exName];
+    if (!hist || hist.length === 0) return null;
+    const meta = exMeta[exName];
+    if (!meta || meta.isBodyweight) return null;
+    const last = hist[hist.length - 1];
+    if (signal !== 'increase') return null;
+    // KB exercises: add 2kg. Barbell: add 5lbs. Dumbbell: add 5lbs.
+    const increment = meta.isKb ? 2 : 5;
+    return last.bestWeight + increment;
+  }
+
+  // ── Summary counts ──────────────────────────────────────────────────────────
+  let countIncrease = 0, countHold = 0, countDrop = 0, countNone = 0;
+  Object.keys(exMeta).forEach(name => {
+    const s = getSignal(name).signal;
+    if (s === 'increase') countIncrease++;
+    else if (s === 'hold') countHold++;
+    else if (s === 'drop') countDrop++;
+    else countNone++;
+  });
+
+  // ── Render ──────────────────────────────────────────────────────────────────
+  let html = `
+    <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-bottom:18px">
+      <div style="background:rgba(52,199,89,0.12);border-radius:var(--r-sm);padding:10px;text-align:center">
+        <div style="font-size:22px;font-weight:700;color:#34C759;font-family:var(--font-mono)">${countIncrease}</div>
+        <div style="font-size:11px;color:var(--text2);margin-top:2px">Increase weight</div>
+      </div>
+      <div style="background:rgba(255,149,0,0.12);border-radius:var(--r-sm);padding:10px;text-align:center">
+        <div style="font-size:22px;font-weight:700;color:#FF9500;font-family:var(--font-mono)">${countHold}</div>
+        <div style="font-size:11px;color:var(--text2);margin-top:2px">Hold steady</div>
+      </div>
+      <div style="background:rgba(255,68,68,0.10);border-radius:var(--r-sm);padding:10px;text-align:center">
+        <div style="font-size:22px;font-weight:700;color:#FF4444;font-family:var(--font-mono)">${countDrop}</div>
+        <div style="font-size:11px;color:var(--text2);margin-top:2px">Fix form/weight</div>
+      </div>
+    </div>
+    <p style="font-size:12px;color:var(--text3);margin-bottom:16px;line-height:1.5">Green = hit target reps for 2 sessions in a row → increase weight. Amber = 1 session hit, hold. Red = missed target reps → fix form or reduce weight.</p>`;
+
+  DAYS.forEach(day => {
+    html += `<div class="target-day-hdr">${day.name} — ${day.focus}</div>`;
+    day.exercises.forEach(ex => {
+      const { signal, label, color, bg } = getSignal(ex.name);
+      const meta = exMeta[ex.name];
+      const hist = exHistory[ex.name] || [];
+      const last = hist.length ? hist[hist.length - 1] : null;
+      const prev = hist.length >= 2 ? hist[hist.length - 2] : null;
+      const unit = meta?.isKb ? 'kg' : meta?.isBodyweight ? '' : 'lbs';
+      const nextWeight = getNextWeight(ex.name, signal);
       const numMatch = ex.targetWeight.match(/[\d.]+/);
       const targetNum = numMatch ? parseFloat(numMatch[0]) : null;
-      const achieved = !isBodyweight && targetNum && current>=targetNum;
-      let pct = 0, pctStr='No data yet';
-      if (!isBodyweight && targetNum && current>0) {
-        pct = Math.min(100, Math.round((current/targetNum)*100));
-        pctStr = pct+'%';
-      } else if (isBodyweight) { pct=100; pctStr='BW'; }
-      html+=`<div class="target-row ${achieved?'target-achieved':''}">
-        <div class="target-ex-name">${ex.name}</div>
-        <div style="font-size:11px;color:var(--text3);margin-bottom:6px">${ex.targetNote}</div>
-        <div class="target-progress-row">
-          <div class="target-current">${current>0?current+'kg':'—'}</div>
-          <div class="target-bar-bg"><div class="target-bar-fill" style="width:${pct}%"></div></div>
-          <div class="target-pct">${pctStr}</div>
-          <div class="target-goal">${ex.targetWeight}</div>
+      const current = last?.bestWeight || 0;
+      const isBodyweight = meta?.isBodyweight;
+      let pct = 0;
+      if (!isBodyweight && targetNum && current > 0) pct = Math.min(100, Math.round((current / targetNum) * 100));
+      else if (isBodyweight) pct = 100;
+
+      const signalDot = signal === 'none' ? `<span style="width:8px;height:8px;border-radius:50%;background:var(--text3);display:inline-block;margin-right:6px"></span>`
+        : `<span style="width:8px;height:8px;border-radius:50%;background:${color};display:inline-block;margin-right:6px"></span>`;
+
+      html += `<div class="target-row" style="${bg ? `background:${bg};border-color:${color}40` : ''}">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+          <div class="target-ex-name" style="font-size:13px;font-weight:500;color:var(--text)">${ex.name}</div>
+          <div style="display:flex;align-items:center;font-size:11px;font-weight:600;color:${color}">${signalDot}${label}</div>
+        </div>
+        <div style="font-size:11px;color:var(--text3);margin-bottom:8px">${ex.scheme} · ${ex.targetNote}</div>
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+          <span style="font-size:11px;color:var(--text2);min-width:64px;font-family:var(--font-mono)">${current > 0 ? current + unit : '—'}</span>
+          <div style="flex:1;height:5px;background:var(--bg4);border-radius:3px;overflow:hidden">
+            <div style="height:5px;border-radius:3px;background:${color};width:${pct}%;transition:width .4s"></div>
+          </div>
+          <span style="font-size:11px;color:var(--text3);min-width:48px;text-align:right;font-family:var(--font-mono)">${ex.targetWeight}</span>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          ${last ? `<span style="font-size:11px;background:var(--bg3);padding:2px 8px;border-radius:6px;color:var(--text2);font-family:var(--font-mono)">Last: ${last.bestWeight}${unit} · ${last.setsHittingTarget}/${meta?.targetSets || '?'} sets hit</span>` : ''}
+          ${prev ? `<span style="font-size:11px;background:var(--bg3);padding:2px 8px;border-radius:6px;color:var(--text3);font-family:var(--font-mono)">Prev: ${prev.bestWeight}${unit} · ${prev.setsHittingTarget}/${meta?.targetSets || '?'} sets hit</span>` : ''}
+          ${nextWeight ? `<span style="font-size:11px;background:rgba(52,199,89,0.15);padding:2px 8px;border-radius:6px;color:#34C759;font-weight:600;font-family:var(--font-mono)">Next: ${nextWeight}${unit}</span>` : ''}
         </div>
       </div>`;
     });
   });
+
   el.innerHTML = html;
 }
 
@@ -1043,15 +1170,17 @@ function renderProgress() {
   let html=`<p style="font-size:13px;color:var(--text2);margin-bottom:16px;line-height:1.5">Best weight per session. A rising line = progressive overload = results.</p>`;
   names.forEach((name,i)=>{
     const d=exData[name];
+    const u=getUnit(name);
     const latest=d[d.length-1]?.best||0, first=d[0]?.best||0, delta=latest-first;
-    html+=`<div class="prog-ex-card"><div class="prog-ex-hdr"><div class="prog-ex-name">${name}</div><div class="prog-ex-meta">${d.length} session${d.length>1?'s':''} · Latest: ${latest}kg</div>${d.length>1?`<span class="prog-best">${delta>=0?'+':''}${delta}kg since start</span>`:''}</div><div class="chart-wrap"><canvas id="ch-${i}" height="110"></canvas></div></div>`;
+    html+=`<div class="prog-ex-card"><div class="prog-ex-hdr"><div class="prog-ex-name">${name}</div><div class="prog-ex-meta">${d.length} session${d.length>1?'s':''} · Latest: ${latest}${u}</div>${d.length>1?`<span class="prog-best">${delta>=0?'+':''}${delta}${u} since start</span>`:''}</div><div class="chart-wrap"><canvas id="ch-${i}" height="110"></canvas></div></div>`;
   });
   el.innerHTML=html;
   setTimeout(()=>{
     names.forEach((name,i)=>{
       const d=exData[name], canvas=document.getElementById(`ch-${i}`);
+      const u=getUnit(name);
       if (!canvas) return;
-      charts[i]=new Chart(canvas,{type:'line',data:{labels:d.map(x=>x.label),datasets:[{data:d.map(x=>x.best),borderColor:ac,backgroundColor:isLight?'rgba(61,122,0,0.08)':'rgba(200,255,0,0.07)',borderWidth:2,pointBackgroundColor:ac,pointRadius:4,pointHoverRadius:6,tension:.35,fill:true}]},options:{responsive:true,plugins:{legend:{display:false},tooltip:{backgroundColor:isLight?'#fff':'#1E1E1E',titleColor:isLight?'#000':'#F0F0F0',bodyColor:tc,borderColor:gc,borderWidth:1,callbacks:{label:ctx=>` ${ctx.parsed.y} kg`}}},scales:{x:{ticks:{color:tc,font:{size:10}},grid:{color:gc}},y:{ticks:{color:tc,font:{size:10},callback:v=>v+'kg'},grid:{color:gc},beginAtZero:false}}}});
+      charts[i]=new Chart(canvas,{type:'line',data:{labels:d.map(x=>x.label),datasets:[{data:d.map(x=>x.best),borderColor:ac,backgroundColor:isLight?'rgba(61,122,0,0.08)':'rgba(200,255,0,0.07)',borderWidth:2,pointBackgroundColor:ac,pointRadius:4,pointHoverRadius:6,tension:.35,fill:true}]},options:{responsive:true,plugins:{legend:{display:false},tooltip:{backgroundColor:isLight?'#fff':'#1E1E1E',titleColor:isLight?'#000':'#F0F0F0',bodyColor:tc,borderColor:gc,borderWidth:1,callbacks:{label:ctx=>` ${ctx.parsed.y}${u}`}}},scales:{x:{ticks:{color:tc,font:{size:10}},grid:{color:gc}},y:{ticks:{color:tc,font:{size:10},callback:v=>v+u},grid:{color:gc},beginAtZero:false}}}});
     });
   },60);
 }
@@ -1065,7 +1194,7 @@ function renderHistory() {
     const ds=d.toLocaleDateString('en-GB',{weekday:'short',day:'numeric',month:'short',year:'numeric'});
     const ts=d.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'});
     const liftsHtml=(s.lifts||[]).slice(0,4).map(l=>{
-      const best=l.sets.filter(x=>x.done&&x.weight>0).map(x=>`${x.weight}kg×${x.reps}`).join(', ');
+      const best=l.sets.filter(x=>x.done&&x.weight>0).map(x=>`${x.weight}${getUnit(l.exercise)}×${x.reps}`).join(', ');
       return `<div class="hist-lift"><strong>${l.exercise}:</strong> ${best||'logged'}</div>`;
     }).join('')+(s.lifts&&s.lifts.length>4?`<div class="hist-lift" style="color:var(--text3)">+${s.lifts.length-4} more</div>`:'');
     return `<div class="hist-entry"><div class="hist-date">${ds} · ${ts}</div><div class="hist-day">${s.day} — ${s.focus}</div><div class="hist-sets">${s.sets} sets completed</div>${liftsHtml}${s.notes?`<div class="hist-note">"${s.notes}"</div>`:''}</div>`;
@@ -1079,7 +1208,7 @@ function buildReport(src) {
     const d=new Date(s.date).toLocaleDateString('en-GB',{weekday:'short',day:'numeric',month:'short',year:'numeric'});
     const t=new Date(s.date).toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'});
     const liftLines=(s.lifts||[]).map(l=>{
-      const setLines=l.sets.map(x=>`    Set ${x.set}: ${x.weight>0?x.weight+'kg':'-'} × ${x.reps>0?x.reps+' reps':'-'}${x.done?' ✓':''}`).join('\n');
+      const setLines=l.sets.map(x=>`    Set ${x.set}: ${x.weight>0?x.weight+getUnit(l.exercise):'-'} × ${x.reps>0?x.reps+' reps':'-'}${x.done?' ✓':''}`).join('\n');
       return `  ${l.exercise}:\n${setLines}`;
     }).join('\n');
     return `📅 ${d} ${t} — ${s.day} (${s.focus})\nSets completed: ${s.sets}\n${liftLines}${s.notes?`\nNotes: "${s.notes}"`: ''}`;
